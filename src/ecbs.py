@@ -290,7 +290,7 @@ class ECBS:
             low_id = self.low_id
             self.low_id += 1
             one = FaOne(ctx, low_id, time_num, from_state, goal_state)
-            sr = one.search_one()
+            sr = one.search_one
             expanded_count += sr.expandedCount
 
             if not sr.ok:
