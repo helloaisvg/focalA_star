@@ -1,12 +1,33 @@
 import heapq
 import logging
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from math import ceil
+from typing import Dict, Tuple, Optional
 
 from pydash import find, find_index
 
-from src.domain import State, TargetOnePlanResult, OpenLowNode, FocalLowNode, LowNode, FaContext, FaOp
+from src.domain import State, TargetOnePlanResult, LowNode, FaContext, FaOp
+"""字典优化"""
+
+@dataclass(order=False, frozen=True)
+class OpenLowNode:
+    """open节点，按 f 值排序"""
+    n: LowNode = field(compare=False)
+
+    # For heap comparison
+    def __lt__(self, other):
+        return self.n.f < other.n.f
+
+
+@dataclass(order=False, frozen=True)
+class FocalLowNode:
+    """焦点集结点按f2排序"""
+    n: LowNode = field(compare=False)
+
+    # 比较堆
+    def __lt__(self, other):
+        return self.n.f2 < other.n.f2
 
 
 class FaOne:
@@ -24,6 +45,7 @@ class FaOne:
         :param goal_state:
         :param last_goal_constraint: 如果目标位置被约束了，last_goal_constraint 是被约束的最后一个时刻
         """
+
         print(f"Search one: offset={time_offset}, start={start_state}, goal={goal_state}")
         self.ctx = ctx
         self.time_offset = time_offset
@@ -57,8 +79,8 @@ class FaOne:
         self.focal_set: list[FocalLowNode] = []
         self.closed_set: dict[int, LowNode] = {}  # by cell index
 
-        # 字典，用于存储每个单元格位置的最佳g值
-        self.best_g_values: dict[int, float] = {}
+        """key 为 cell_index，value为实际的OpenLowNode 对象"""
+        self.open_dict: Dict[int, OpenLowNode] = {}
 
     def search_one(self):
         r = self.do_search_one()
@@ -90,58 +112,22 @@ class FaOne:
             f2=0.0,
         )
 
-        heapq.heappush(self.open_set, OpenLowNode(start_node))
+        open_node = OpenLowNode(start_node)
+        heapq.heappush(self.open_set, open_node)
+        self.open_dict[self.state_to_index(start_node.state.x, start_node.state.y)] = open_node
+
         heapq.heappush(self.focal_set, FocalLowNode(start_node))
 
-        # 初始化起始位置的最佳g值
-        start_cell_index = self.state_to_index(start_node.state.x, start_node.state.y)
-        self.best_g_values[start_cell_index] = 0.0
-
-        # 跟踪open中的当前最小f值
-        min_f = start_node.f
-
-        # 跟踪最后绑定以优化焦点集更新
-        last_bound = min_f * self.ctx.w
-
         while self.open_set:
-            # 获取open中的当前最小f值
-            current_min_f = self.open_set[0].n.f
+            min_f = self.open_set[0].n.f  # 读取最小的节点，但不删除
 
-            # 如果min_f已更改，则更新焦点集
-            if current_min_f > min_f:
-                new_bound = current_min_f * self.ctx.w
+            self.focal_set = []
+            bound = min_f * self.ctx.w
+            for node in self.open_set:
+                if node.n.f <= bound:
+                    heapq.heappush(self.focal_set, FocalLowNode(node.n))
 
-                # 如果新节点现在符合条件，则将其添加到焦点集中
-                if new_bound > last_bound:
-                    for open_node in self.open_set:
-                        if last_bound < open_node.n.f <= new_bound:
-                            heapq.heappush(self.focal_set, FocalLowNode(open_node.n))
-
-                min_f = current_min_f
-                last_bound = new_bound
-
-            # 无需每次从头开始重建焦点集
-            # 仅在min_f更改时更新它，绑定也会更改
-
-            # 如果焦点集为空重建它
-            if not self.focal_set:
-                bound = min_f * self.ctx.w
-                for node in self.open_set:
-                    if node.n.f <= bound:
-                        heapq.heappush(self.focal_set, FocalLowNode(node.n))
-                last_bound = bound
-
-            # 从焦点集中获取最佳节点
-            if not self.focal_set:
-                return TargetOnePlanResult(
-                    self.ctx.robotName,
-                    False,
-                    "Focal set is empty",
-                    planCost=time.time() - self.op.startedOn,
-                    fromState=self.start_state,
-                    toState=self.goal_state,
-                )
-
+            # 取出下一个有界最优启发值最低的节点
             min_focal_n: LowNode = heapq.heappop(self.focal_set).n
             min_focal_s = min_focal_n.state
 
@@ -150,14 +136,13 @@ class FaOne:
             self.op.openSize.append(len(self.open_set))
             self.op.focalSize.append(len(self.focal_set))
 
-            # 从open中删除
+            # 从 open 中删除
             self.remove_open_node(min_focal_n)
 
-            # 加入到closed
-            cell_index = self.state_to_index(min_focal_s.x, min_focal_s.y)
-            self.closed_set[cell_index] = min_focal_n
+            # 加入到 close
+            self.closed_set[self.state_to_index(min_focal_s.x, min_focal_s.y)] = min_focal_n
 
-            if self.op.expandedCount > self.ctx.mapDimX * self.ctx.mapDimY * 2:  # Increased limit a bit
+            if self.op.expandedCount > self.ctx.mapDimX * self.ctx.mapDimY:
                 return TargetOnePlanResult(
                     self.ctx.robotName,
                     False,
@@ -178,22 +163,12 @@ class FaOne:
                 focal_heuristic = (min_focal_n.f2 +
                                    self.focal_state_heuristic(neighbor, g) +
                                    self.focal_transition_heuristic(min_focal_s, neighbor, min_focal_n.g, g))
-
-                cell_index = self.state_to_index(neighbor.x, neighbor.y)
-
-                # 检查是否已经为这个位置提供了更好的g值
-                if cell_index in self.best_g_values and g >= self.best_g_values[cell_index]:
-                    # 如果已经找到了更好路径，请跳过
-                    continue
-
-                # 跟新 best g-value
-                self.best_g_values[cell_index] = g
-
                 node = LowNode(neighbor, min_focal_n, f=f, f2=focal_heuristic, g=g)
 
-                # 检查是否在f值较低的closed中
+                cell_index = self.state_to_index(neighbor.x, neighbor.y)
                 old_closed = self.closed_set.get(cell_index)
                 if old_closed:
+                    # 如果在 close 里
                     if f < old_closed.f:
                         self.op.warnings.append(f"SmallerFInClosed|{cell_index}|{neighbor.x},{neighbor.y}|"
                                                 f"{neighbor.timeStart}:{neighbor.timeEnd}|"
@@ -203,28 +178,19 @@ class FaOne:
                     else:
                         continue
 
-                # 检查是否在open中
-                old_open = find(self.open_set, lambda n: n.n.state.x == neighbor.x and n.n.state.y == neighbor.y)
+                #使用字典检查是否已经处于 open set 中
+                old_open = self.open_dict.get(cell_index)
                 if old_open:
-                    # 如果在g值较差的open中，更新它
+                    # 如果在 open 里，如果 g 变小了，更新
                     if g >= old_open.n.g:
                         continue
-                    node = replace(old_open.n, g=g, f=g + self.admissible_heuristic(neighbor), parent=min_focal_n)
-                    self.replace_open_node(OpenLowNode(node))
-
-                    #同样如果焦点集中有，也要更新
-                    focal_index = find_index(self.focal_set,
-                                             lambda n: n.n.state.x == neighbor.x and n.n.state.y == neighbor.y)
-                    if focal_index >= 0:
-                        self.focal_set[focal_index] = FocalLowNode(node)
-                        heapq.heapify(self.focal_set)  #重建 focal set
+                    new_node = replace(old_open.n, g=g, f=old_open.n.f + g - old_open.n.g)
+                    new_open_node = OpenLowNode(new_node)
+                    self.replace_open_node(new_open_node)
                 else:
-                    # 加到open
-                    heapq.heappush(self.open_set, OpenLowNode(node))
-
-                    # 如果符合约束标准，则添加到焦点集
-                    if f <= min_f * self.ctx.w:
-                        heapq.heappush(self.focal_set, FocalLowNode(node))
+                    new_open_node = OpenLowNode(node)
+                    heapq.heappush(self.open_set, new_open_node)
+                    self.open_dict[cell_index] = new_open_node
 
         return TargetOnePlanResult(
             self.ctx.robotName,
@@ -286,7 +252,7 @@ class FaOne:
 
         # 270 改成 90
         if d_head > 180:
-            d_head = 360 - d_head  # 改角度
+            d_head = 90
 
         d_head /= 90
 
@@ -321,52 +287,67 @@ class FaOne:
         return x + y * self.ctx.mapDimX
 
     def remove_open_node(self, node: LowNode):
+        """
+        使用字典进行 O（1） 查找并从open中删除节点
+        """
         s = node.state
-        index = find_index(self.open_set, lambda n: n.n.state.x == s.x and n.n.state.y == s.y)
-        if index < 0:
+        cell_index = self.state_to_index(s.x, s.y)
+
+        # 检查节点是否在opendict
+        if cell_index not in self.open_dict:
             return
-        else:
-            # 更快删除
-            if index == 0:
-                # 是root直接弹出
-                heapq.heappop(self.open_set)
-            else:
-                # 不是则替换最后一个
-                self.open_set[index] = self.open_set[-1]
-                self.open_set.pop()
 
-                if index < len(self.open_set):
-                    #没到终点
-                    self._sift_down(self.open_set, 0, index)
+        # 在open找节点
+        target_node = self.open_dict[cell_index]
 
-    def _sift_down(self, heap, startpos, pos):
-        """
-        替换元素后恢复堆不变
-        """
-        newitem = heap[pos]
-        # 把较小的项向上冒泡，直到到根部
-        while pos > startpos:
-            parentpos = (pos - 1) >> 1
-            parent = heap[parentpos]
-            if newitem < parent:
-                heap[pos] = parent
-                pos = parentpos
-                continue
-            break
-        heap[pos] = newitem
+        #从字典中删除
+        del self.open_dict[cell_index]
+
+        #在堆中找索引
+        idx = None
+        for i, open_node in enumerate(self.open_set):
+            if open_node.n.state.x == s.x and open_node.n.state.y == s.y:
+                idx = i
+                break
+
+        if idx is not None:
+            # 和最后一个元素交换
+            self.open_set[idx] = self.open_set[-1]
+            self.open_set.pop()
+            #重建堆
+            heapq.heapify(self.open_set)
 
     def replace_open_node(self, new_one: OpenLowNode):
+        """
+        将打开集中的节点替换为具有相同位置的新节点
+        """
         s = new_one.n.state
-        index = find_index(self.open_set, lambda n: n.n.state.x == s.x and n.n.state.y == s.y)
-        if index < 0:
-            heapq.heappush(self.open_set, new_one)
-        else:
-            # 还原堆属性
-            self.open_set[index] = new_one
+        cell_index = self.state_to_index(s.x, s.y)
 
-            # 确保两个方向的 heap 属性
-            self._sift_down(self.open_set, 0, index)
-            heapq._siftup(self.open_set, index)  #使用 heapq 的内部_siftup
+        # 先检查节点是不是在opendict中
+        if cell_index not in self.open_dict:
+            # Add
+            heapq.heappush(self.open_set, new_one)
+            self.open_dict[cell_index] = new_one
+            return
+
+        # open set找节点
+        idx = None
+        for i, open_node in enumerate(self.open_set):
+            if open_node.n.state.x == s.x and open_node.n.state.y == s.y:
+                idx = i
+                break
+
+        if idx is not None:
+            # 替换
+            self.open_set[idx] = new_one
+            # 跟新字典
+            self.open_dict[cell_index] = new_one
+            #重建堆
+            heapq.heapify(self.open_set)
+    """ else:
+            heapq.heappush(self.open_set, new_one)
+            self.open_dict[cell_index] = new_one"""
 
     def build_ok_result(self, min_focal_n: LowNode):
         # 达到时间在最后一次目标点被约束的时刻后
