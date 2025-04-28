@@ -8,7 +8,7 @@ from pydash import find, find_index
 
 from src.domain import State, TargetOnePlanResult, OpenLowNode, FocalLowNode, LowNode, FaContext, FaOp
 
-
+"""启发函数缓存"""
 class FaOne:
     """
     单目标
@@ -30,6 +30,11 @@ class FaOne:
         self.start_state = start_state
         self.goal_state = goal_state
         self.last_goal_constraint = last_goal_constraint
+
+        # 添加缓存字典，用于存储启发式函数的计算结果
+        self.heuristic_cache = {}
+        self.focal_state_heuristic_cache = {}
+        self.focal_transition_heuristic_cache = {}
 
         self.op = FaOp(
             robotName=ctx.robotName,
@@ -56,9 +61,6 @@ class FaOne:
         self.open_set: list[OpenLowNode] = []
         self.focal_set: list[FocalLowNode] = []
         self.closed_set: dict[int, LowNode] = {}  # by cell index
-
-        # 字典，用于存储每个单元格位置的最佳g值
-        self.best_g_values: dict[int, float] = {}
 
     def search_one(self):
         r = self.do_search_one()
@@ -93,55 +95,16 @@ class FaOne:
         heapq.heappush(self.open_set, OpenLowNode(start_node))
         heapq.heappush(self.focal_set, FocalLowNode(start_node))
 
-        # 初始化起始位置的最佳g值
-        start_cell_index = self.state_to_index(start_node.state.x, start_node.state.y)
-        self.best_g_values[start_cell_index] = 0.0
-
-        # 跟踪open中的当前最小f值
-        min_f = start_node.f
-
-        # 跟踪最后绑定以优化焦点集更新
-        last_bound = min_f * self.ctx.w
-
         while self.open_set:
-            # 获取open中的当前最小f值
-            current_min_f = self.open_set[0].n.f
+            min_f = self.open_set[0].n.f  # 读取最小的节点，但不删除
 
-            # 如果min_f已更改，则更新焦点集
-            if current_min_f > min_f:
-                new_bound = current_min_f * self.ctx.w
+            self.focal_set = []
+            bound = min_f * self.ctx.w
+            for node in self.open_set:
+                if node.n.f <= bound:
+                    heapq.heappush(self.focal_set, FocalLowNode(node.n))
 
-                # 如果新节点现在符合条件，则将其添加到焦点集中
-                if new_bound > last_bound:
-                    for open_node in self.open_set:
-                        if last_bound < open_node.n.f <= new_bound:
-                            heapq.heappush(self.focal_set, FocalLowNode(open_node.n))
-
-                min_f = current_min_f
-                last_bound = new_bound
-
-            # 无需每次从头开始重建焦点集
-            # 仅在min_f更改时更新它，绑定也会更改
-
-            # 如果焦点集为空重建它
-            if not self.focal_set:
-                bound = min_f * self.ctx.w
-                for node in self.open_set:
-                    if node.n.f <= bound:
-                        heapq.heappush(self.focal_set, FocalLowNode(node.n))
-                last_bound = bound
-
-            # 从焦点集中获取最佳节点
-            if not self.focal_set:
-                return TargetOnePlanResult(
-                    self.ctx.robotName,
-                    False,
-                    "Focal set is empty",
-                    planCost=time.time() - self.op.startedOn,
-                    fromState=self.start_state,
-                    toState=self.goal_state,
-                )
-
+            # 取出下一个有界最优启发值最低的节点
             min_focal_n: LowNode = heapq.heappop(self.focal_set).n
             min_focal_s = min_focal_n.state
 
@@ -150,14 +113,13 @@ class FaOne:
             self.op.openSize.append(len(self.open_set))
             self.op.focalSize.append(len(self.focal_set))
 
-            # 从open中删除
+            # 从 open 中删除
             self.remove_open_node(min_focal_n)
 
-            # 加入到closed
-            cell_index = self.state_to_index(min_focal_s.x, min_focal_s.y)
-            self.closed_set[cell_index] = min_focal_n
+            # 加入到 close
+            self.closed_set[self.state_to_index(min_focal_s.x, min_focal_s.y)] = min_focal_n
 
-            if self.op.expandedCount > self.ctx.mapDimX * self.ctx.mapDimY * 2:  # Increased limit a bit
+            if self.op.expandedCount > self.ctx.mapDimX * self.ctx.mapDimY:
                 return TargetOnePlanResult(
                     self.ctx.robotName,
                     False,
@@ -178,22 +140,12 @@ class FaOne:
                 focal_heuristic = (min_focal_n.f2 +
                                    self.focal_state_heuristic(neighbor, g) +
                                    self.focal_transition_heuristic(min_focal_s, neighbor, min_focal_n.g, g))
-
-                cell_index = self.state_to_index(neighbor.x, neighbor.y)
-
-                # 检查是否已经为这个位置提供了更好的g值
-                if cell_index in self.best_g_values and g >= self.best_g_values[cell_index]:
-                    # 如果已经找到了更好路径，请跳过
-                    continue
-
-                # 跟新 best g-value
-                self.best_g_values[cell_index] = g
-
                 node = LowNode(neighbor, min_focal_n, f=f, f2=focal_heuristic, g=g)
 
-                # 检查是否在f值较低的closed中
+                cell_index = self.state_to_index(neighbor.x, neighbor.y)
                 old_closed = self.closed_set.get(cell_index)
                 if old_closed:
+                    # 如果在 close 里
                     if f < old_closed.f:
                         self.op.warnings.append(f"SmallerFInClosed|{cell_index}|{neighbor.x},{neighbor.y}|"
                                                 f"{neighbor.timeStart}:{neighbor.timeEnd}|"
@@ -241,25 +193,65 @@ class FaOne:
         两点之间的直线路径
         vs 欧氏距离
         TODO 未考虑旋转
+        使用缓存避免重复计算
         """
-        return (float(abs(from_state.x - self.goal_state.x) + abs(from_state.y - self.goal_state.y))
-                / self.ctx.moveUnitCost)
+        # 创建基于位置的缓存键
+        cache_key = (from_state.x, from_state.y)
+
+        # 检查缓存中是否已存在该计算结果
+        if cache_key in self.heuristic_cache:
+            return self.heuristic_cache[cache_key]
+
+        # 计算启发式值
+        h_value = (float(abs(from_state.x - self.goal_state.x) + abs(from_state.y - self.goal_state.y))
+                   / self.ctx.moveUnitCost)
+
+        # 存入缓存
+        self.heuristic_cache[cache_key] = h_value
+
+        return h_value
 
     def focal_state_heuristic(self, to_state: State, to_state_g: float) -> float:
         """
         故意 inadmissible 的启发式
+        基于位置缓存
         """
-        if self.ctx.focalStateHeuristic is not None:
-            return self.ctx.focalStateHeuristic(to_state, to_state_g)
-        else:
+        if self.ctx.focalStateHeuristic is None:
             return to_state_g
+
+        # 创建基于位置的缓存键
+        cache_key = (to_state.x, to_state.y, to_state_g)
+        # 检查缓存中是否已存在该计算结果
+        if cache_key in self.focal_state_heuristic_cache:
+            return self.focal_state_heuristic_cache[cache_key]
+
+        # 计算启发式值
+        h_value = self.ctx.focalStateHeuristic(to_state, to_state_g)
+
+        # 存入缓存
+        self.focal_state_heuristic_cache[cache_key] = h_value
+
+        return h_value
 
     def focal_transition_heuristic(self, from_state: State, to_state: State,
                                    from_state_g: float, to_state_g: float) -> float:
-        if self.ctx.focalTransitionHeuristic is not None:
-            return self.ctx.focalTransitionHeuristic(from_state, to_state, from_state_g, to_state_g)
-        else:
+        if self.ctx.focalTransitionHeuristic is None:
             return to_state_g - from_state_g
+
+        # 创建基于位置和g值的缓存键
+        cache_key = (from_state.x, from_state.y, to_state.x, to_state.y, from_state_g, to_state_g)
+
+        # 检查缓存中是否已存在该计算结果
+        if cache_key in self.focal_transition_heuristic_cache:
+            return self.focal_transition_heuristic_cache[cache_key]
+
+        # 计算启发式值
+        h_value = self.ctx.focalTransitionHeuristic(from_state, to_state, from_state_g, to_state_g)
+
+        # 存入缓存
+        self.focal_transition_heuristic_cache[cache_key] = h_value
+
+        return h_value
 
     def get_neighbors(self, from_state: State) -> list[State]:
         neighbors = []
@@ -286,7 +278,7 @@ class FaOne:
 
         # 270 改成 90
         if d_head > 180:
-            d_head = 360 - d_head  # 改角度
+            d_head = 90
 
         d_head /= 90
 
@@ -326,34 +318,11 @@ class FaOne:
         if index < 0:
             return
         else:
-            # 更快删除
-            if index == 0:
-                # 是root直接弹出
-                heapq.heappop(self.open_set)
-            else:
-                # 不是则替换最后一个
-                self.open_set[index] = self.open_set[-1]
-                self.open_set.pop()
-
-                if index < len(self.open_set):
-                    #没到终点
-                    self._sift_down(self.open_set, 0, index)
-
-    def _sift_down(self, heap, startpos, pos):
-        """
-        替换元素后恢复堆不变
-        """
-        newitem = heap[pos]
-        # 把较小的项向上冒泡，直到到根部
-        while pos > startpos:
-            parentpos = (pos - 1) >> 1
-            parent = heap[parentpos]
-            if newitem < parent:
-                heap[pos] = parent
-                pos = parentpos
-                continue
-            break
-        heap[pos] = newitem
+            # 把最后一个填充过来
+            self.open_set[index] = self.open_set[-1]
+            self.open_set.pop()
+            # 必须重建！o(n)
+            heapq.heapify(self.open_set)
 
     def replace_open_node(self, new_one: OpenLowNode):
         s = new_one.n.state
@@ -361,12 +330,9 @@ class FaOne:
         if index < 0:
             heapq.heappush(self.open_set, new_one)
         else:
-            # 还原堆属性
             self.open_set[index] = new_one
-
-            # 确保两个方向的 heap 属性
-            self._sift_down(self.open_set, 0, index)
-            heapq._siftup(self.open_set, index)  #使用 heapq 的内部_siftup
+            # 必须重建！o(n)
+            heapq.heapify(self.open_set)
 
     def build_ok_result(self, min_focal_n: LowNode):
         # 达到时间在最后一次目标点被约束的时刻后
