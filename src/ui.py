@@ -553,7 +553,7 @@ class MapfUi:
             self.sim_btn.setText('Stop Sim')
             self.adg_nodes = build_adg(self.plan)
             self.finished_adg_nodes.clear()
-        
+
     def stop_sim(self):
         self.simulation = False
         self.sim_btn.setText('Start Sim')
