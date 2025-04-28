@@ -7,7 +7,7 @@ from math import ceil
 from pydash import find, find_index
 
 from src.domain import State, TargetOnePlanResult, OpenLowNode, FocalLowNode, LowNode, FaContext, FaOp
-
+"""焦点集优化"""
 
 class FaOne:
     """
@@ -90,29 +90,24 @@ class FaOne:
         heapq.heappush(self.open_set, OpenLowNode(start_node))
         heapq.heappush(self.focal_set, FocalLowNode(start_node))
 
-        # min_f = start_node.f
+        min_f = start_node.f
+        bound = min_f * self.ctx.w
 
         while self.open_set:
-            # 每次进来重建 focal set，因此后续都不处理向 focal set 添加元素
-            # old_min_f = min_f
-            min_f = self.open_set[0].n.f  # 读取最小的节点，但不删除
+            # 获取当前最小f值
+            new_min_f = self.open_set[0].n.f
 
-            self.focal_set = []
-            bound = min_f * self.ctx.w
-            for node in self.open_set:
-                if node.n.f <= bound:
-                    heapq.heappush(self.focal_set, FocalLowNode(node.n))
+            # 仅在最小f值发生变化时更新焦点集
+            if new_min_f > min_f:
+                new_bound = new_min_f * self.ctx.w
 
-            # TODO 有这一步，可以不要上一步？而且会导致重复添加到 focal_set
-            # old_bound = old_min_f * self.w
-            # if min_f > old_min_f:  # top.n.f 值肯定在增大
-            #     for node in open_set:
-            #         # 之前不在 focal_set，本轮新加入 focal_set 的节点
-            #         if old_bound < node.n.f <= bound:
-            #             heapq.heappush(focal_set, FocalLowNode(node.n))
-            #         # 因为 open_set 不是有序的（按 f 递增），所以不能 break
-            #         # if node.n.f > bound:
-            #         #     break
+                # 添加现在位于新边界内的节点
+                for node in self.open_set:
+                    if min_f * self.ctx.w < node.n.f <= new_bound:
+                        heapq.heappush(self.focal_set, FocalLowNode(node.n))
+
+                min_f = new_min_f
+                bound = new_bound
 
             # 取出下一个有界最优启发值最低的节点
             min_focal_n: LowNode = heapq.heappop(self.focal_set).n
@@ -171,8 +166,14 @@ class FaOne:
                         continue
                     node = replace(old_open.n, g=g, f=old_open.n.f + g - old_open.n.g)
                     self.replace_open_node(OpenLowNode(node))
+                    # 如果节点在焦点边界内，也需要添加到焦点集
+                    if node.f <= bound:
+                        heapq.heappush(self.focal_set, FocalLowNode(node))
                 else:
                     heapq.heappush(self.open_set, OpenLowNode(node))
+                    # 如果节点在焦点边界内，添加到焦点集
+                    if node.f <= bound:
+                        heapq.heappush(self.focal_set, FocalLowNode(node))
 
         return TargetOnePlanResult(
             self.ctx.robotName,
