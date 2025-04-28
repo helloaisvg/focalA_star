@@ -382,7 +382,7 @@ class FaOne:
         goal_stop_time_num = self.ctx.goalStopTimeNum if self.ctx.goalStopTimeNum > 0 else 1
 
         # 最后追加一个原地等待的，模拟动作时间
-
+        # noinspection PyTypeChecker
         action_state = replace(last_state,
                                timeStart=last_state.timeEnd + 1,
                                timeEnd=last_state.timeEnd + goal_stop_time_num,
