@@ -296,9 +296,59 @@ class LowContext:
     moveUnitCost: float
     rotateUnitCost: float
     goalStopTimeNum: int
-    constraints: Optional[RobotConstraints]  # 约束可能为空，初始求解时
-    oldAllPaths: dict[str, list[State]]  # 在进行此次底层求解所有机器人的已知路径
+    constraints: Optional[RobotConstraints] = None  # 约束可能为空，初始求解时
+    oldAllPaths: Optional[dict[str, list[State]]] = None  # 在进行此次底层求解所有机器人的已知路径
 
+
+@dataclass
+class FaContext:
+    """
+    Focal A* Context for low level search
+    """
+    robotName: str
+    highId: int
+    w: float
+    mapDimX: int
+    mapDimY: int
+    obstacles: set[int]
+    moveUnitCost: float
+    rotateUnitCost: float
+    goalStopTimeNum: int
+    neighborValidator: Optional[callable] = None
+    focalStateHeuristic: Optional[callable] = None
+    focalTransitionHeuristic: Optional[callable] = None
+
+
+@dataclass
+class FaOp:
+    """
+    记录一次底层求解过程
+    """
+    robotName: str
+    highId: int
+    lowId: int
+    w: float
+    mapDimX: int
+    mapDimY: int
+    # obstacles: set[int]
+    moveUnitCost: float
+    rotateUnitCost: float
+    goalStopTimeNum: int
+    startCell: str
+    goalCell: str
+    startIndex: int
+    goalIndex: int
+    expandedList: list[str]
+    openSize: list[int]  # 每次展开后 open 集合的大小
+    focalSize: list[int]  # 每次展开后 focal 集合的大小
+    warnings: list[str]
+    ok: bool = False
+    errMsg: str = ""
+    path: Optional[list[State]] = None
+    startedOn: float = 0.0
+    endedOn: float = 0.0
+    timeCost: float = 0.0
+    expandedCount: int = 0
 
 @dataclass_json
 @dataclass

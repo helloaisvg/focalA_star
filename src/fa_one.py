@@ -7,13 +7,13 @@ from typing import Dict, Tuple, Optional
 
 from pydash import find, find_index
 
-from src.domain import State, TargetOnePlanResult, LowNode, FaContext, FaOp
+from src.domain import State, TargetOnePlanResult, FaContext, FaOp
 
 
 @dataclass(order=False, frozen=True)
 class OpenLowNode:
     """open节点，按 f 值排序"""
-    n: LowNode = field(compare=False)
+    n: 'LowNode' = field(compare=False)
 
     # For heap comparison
     def __lt__(self, other):
@@ -23,11 +23,31 @@ class OpenLowNode:
 @dataclass(order=False, frozen=True)
 class FocalLowNode:
     """焦点集结点按f2排序"""
-    n: LowNode = field(compare=False)
+    n: 'LowNode' = field(compare=False)
 
     # 比较堆
     def __lt__(self, other):
         return self.n.f2 < other.n.f2
+
+
+@dataclass
+class LowNode:
+    """
+    低层搜索节点
+    """
+    state: State
+    parent: Optional['LowNode'] = None
+    g: float = 0.0  # 实际成本
+    f: float = 0.0  # 估计总成本 (g + h)
+    f2: float = 0.0  # 用于Focal搜索的值
+    id: int = 0
+
+    def desc(self, map_dim_x: int) -> str:
+        """节点描述信息"""
+        return (f"{self.state.x + self.state.y * map_dim_x}|"
+                f"{self.state.x},{self.state.y}|"
+                f"{self.state.timeStart}:{self.state.timeEnd}|"
+                f"{self.g:.1f}|{self.f:.1f}|{self.f2:.1f}")
 
 
 class FaOne:
@@ -118,11 +138,12 @@ class FaOne:
     def do_search_one(self) -> TargetOnePlanResult:
         # noinspection PyTypeChecker
         start_node = LowNode(
-            replace(self.start_state, timeStart=self.time_offset, timeEnd=self.time_offset, timeNum=1),
-            None,
+            state=replace(self.start_state, timeStart=self.time_offset, timeEnd=self.time_offset, timeNum=1),
+            parent=None,
             f=self.admissible_heuristic(self.start_state),
             g=0.0,
             f2=0.0,
+            id=0
         )
 
         # 将起始节点添加到open_set和open_dict
@@ -142,6 +163,8 @@ class FaOne:
 
         # 跟踪最后绑定以优化焦点集更新
         last_bound = min_f * self.ctx.w
+
+        node_id = 1
 
         while self.open_set:
             # 获取open中的当前最小f值
@@ -224,7 +247,8 @@ class FaOne:
                     # 更新 best g-value
                     self.best_g_values[cell_index] = g
 
-                    node = LowNode(neighbor, min_focal_n, f=f, f2=focal_heuristic, g=g)
+                    node = LowNode(state=neighbor, parent=min_focal_n, f=f, f2=focal_heuristic, g=g, id=node_id)
+                    node_id += 1
 
                     # 检查是否在closed中
                     old_closed = self.closed_set.get(cell_index)

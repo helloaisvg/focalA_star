@@ -8,9 +8,10 @@ from typing import Optional
 
 from pydash import remove, find
 
-from src.domain import RobotTask, MapfResult, TargetManyPlanResult, State, Constraints, is_time_overlay, \
-    VertexConstraint, EdgeConstraint, cell_to_state, HighNode, OpenHighNode, FocalHighNode, FaContext, \
+from src.domain import RobotTask, MapfResult, TargetManyPlanResult, State, RobotConstraints as Constraints, \
+    VertexConstraint, EdgeConstraint, HighNode, OpenHighNode, FocalHighNode, FaContext, \
     TargetOnePlanResult
+from src.common import cell_to_state, is_time_overlay
 from src.fa_one import FaOne
 
 

@@ -1,14 +1,6 @@
-from src.domain import cell_to_state, Cell, RobotTask
+from src.domain import Cell, RobotTask
 from src.ecbs import ECBS
-from src.fsa import FSA
-
-# a_start = FSA(robot_name="A1", high_node_id=0, w=1.0,
-#               map_dim_x=10, map_dim_y=2,
-#               obstacles={1}
-#               )
-# pr = a_start.search(cell_to_state(Cell(0, 0)), [cell_to_state(Cell(4, 0))], 10)
-# print(pr)
-# print([n.desc_loc_head() for n in pr.path])
+from src.common import cell_to_state
 
 ecbs = ECBS(w=1.0, map_dim_x=10, map_dim_y=2, obstacles={2},
             tasks={"A1": RobotTask(name="A1", fromState=Cell(0, 0), toStates=[Cell(4, 0)]),

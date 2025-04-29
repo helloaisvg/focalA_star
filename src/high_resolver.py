@@ -4,7 +4,7 @@ import os
 import shutil
 import time
 from dataclasses import replace
-from typing import Optional
+from typing import Optional, Dict, List
 
 from pydash import find_index
 
@@ -78,7 +78,7 @@ class HighResolver:
             focal_set = []
             bound = best_cost * self.w
             for on in open_set:
-                if on.n.cost <= bound:  # 机器人执行成本:
+                if on.n.cost <= bound:
                     heapq.heappush(focal_set, FocalHighNode(on.n))
 
             high_node = heapq.heappop(focal_set).n
@@ -92,11 +92,15 @@ class HighResolver:
                     plans=high_node.solution,
                     timeCost=time.time() - self.start_on)
 
-            for robot_name, c in high_node.firstConstraints.constraints.items():
-                child_node = self.build_child_hl_node(high_node, robot_name, c)
-                if not child_node:
-                    continue
-                heapq.heappush(open_set, OpenHighNode(child_node))
+            # 合并冲突约束
+            merged_constraints = self.merge_conflicts(high_node.firstConstraints)
+
+            for robot_name, constraints in merged_constraints.items():
+                for c in constraints:
+                    child_node = self.build_child_hl_node(high_node, robot_name, c)
+                    if not child_node:
+                        continue
+                    heapq.heappush(open_set, OpenHighNode(child_node))
 
         return MapfResult(
             ok=False,
@@ -154,6 +158,9 @@ class HighResolver:
         )
 
     def build_child_hl_node(self, parent: HighNode, robot_name: str, constraint: Constraint) -> Optional[HighNode]:
+        """
+        构建子节点，仅施加第一个冲突约束。
+        """
         child_constraints = self.add_constraints(parent, robot_name, constraint)
         robot_constraints = child_constraints[robot_name]
         solution = parent.solution.copy()
@@ -194,21 +201,6 @@ class HighResolver:
         conflicts_count, first_constraints = count_conflicts_find_first_constraints(
             robots_solution_to_robots_paths(solution))
 
-        # 检查是否遵守了约束
-        first_constraint: Optional[Constraint] = first_constraints and first_constraints.constraints.get(robot_name)
-        if first_constraint:
-            if isinstance(first_constraint, VertexConstraint):
-                v_constraints = robot_constraints.vertexConstraints
-                if first_constraint in v_constraints:
-                    raise Exception(f"Constraints already exist for robot {robot_name}, high={child_node_id}: "
-                                    f"{constraint} in {v_constraints}")
-            elif isinstance(first_constraint, EdgeConstraint):
-                e_constraints = robot_constraints.edgeConstraints
-                if first_constraint in e_constraints:
-                    raise Exception(
-                        f"Constraints already exist for robot {robot_name}, high={child_node_id}: "
-                        f"{constraint} in {e_constraints}")
-
         return HighNode(
             id=child_node_id,
             parentId=parent.id,
@@ -226,16 +218,20 @@ class HighResolver:
 
         if isinstance(constraint, VertexConstraint):
             v_constraints = robot_constraints.vertexConstraints.copy()
+            # 检查是否已经存在相同的约束
             if constraint in v_constraints:
-                raise Exception(f"Constraints already exist for robot {robot_name}: {constraint}in {v_constraints}")
+                logging.warning(f"Duplicate vertex constraint detected for robot {robot_name}: {constraint}")
+                return constraints  # 返回原约束，不重复添加
             # noinspection PyTypeChecker
             v_constraints.add(constraint)
             new_robot_constraints = replace(robot_constraints, vertexConstraints=v_constraints)
             constraints[robot_name] = new_robot_constraints
         elif isinstance(constraint, EdgeConstraint):
             e_constraints = robot_constraints.edgeConstraints.copy()
+            # 检查是否已经存在相同的约束
             if constraint in e_constraints:
-                raise Exception(f"Constraints already exist for robot {robot_name}: {constraint} in {e_constraints}")
+                logging.warning(f"Duplicate edge constraint detected for robot {robot_name}: {constraint}")
+                return constraints  # 返回原约束，不重复添加
             # noinspection PyTypeChecker
             e_constraints.add(constraint)
             new_robot_constraints = replace(robot_constraints, edgeConstraints=e_constraints)
@@ -252,7 +248,7 @@ class HighResolver:
 
         from_state = start_state
         ok = True
-        reason = ""
+        reason = ""  # 确保 reason 被初始化
 
         steps: list[TargetOnePlanResult] = []
         path: list[State] = []
@@ -270,7 +266,7 @@ class HighResolver:
 
             if not sr.ok:
                 ok = False
-                reason = sr.reason
+                reason = sr.reason  # 修改为 reason
                 break
 
             steps.append(sr)
@@ -284,7 +280,7 @@ class HighResolver:
         return TargetManyPlanResult(
             ctx.robotName,
             ok,
-            reason,
+            reason,  # 返回 reason
             cost=cost,
             expandedCount=expanded_count,
             planCost=time.time() - start_on,
@@ -314,3 +310,31 @@ class HighResolver:
             if vc.x == goal.x and vc.y == goal.y:
                 last_goal_constraint = max(last_goal_constraint, vc.timeEnd)
         return last_goal_constraint
+
+    def merge_conflicts(self, first_constraints) -> Dict[str, List[Constraint]]:
+        """
+        合并冲突约束，减少低层搜索次数
+        """
+        merged_constraints = {}
+        for robot_name, constraints in first_constraints.constraints.items():
+            if not isinstance(constraints, list):
+                constraints = [constraints]
+            if robot_name not in merged_constraints:
+                merged_constraints[robot_name] = []
+            for c in constraints:
+                if not any(self.is_conflict_merged(c, existing) for existing in merged_constraints[robot_name]):
+                    merged_constraints[robot_name].append(c)
+        return merged_constraints
+
+    @staticmethod
+    def is_conflict_merged(c1: Constraint, c2: Constraint) -> bool:
+        """
+        检查两个约束是否可以合并
+        """
+        if isinstance(c1, VertexConstraint) and isinstance(c2, VertexConstraint):
+            return c1.x == c2.x and c1.y == c2.y and c1.timeStart == c2.timeStart
+        if isinstance(c1, EdgeConstraint) and isinstance(c2, EdgeConstraint):
+            return (c1.x1 == c2.x1 and c1.y1 == c2.y1 and
+                    c1.x2 == c2.x2 and c2.y2 == c2.y2 and
+                    c1.timeStart == c2.timeStart)
+        return False
