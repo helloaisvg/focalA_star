@@ -3,7 +3,7 @@ import logging
 import time
 from dataclasses import replace
 from math import ceil
-from typing import Optional
+from typing import Optional, Set, Dict, Tuple
 
 from pydash import find_index
 
@@ -48,6 +48,18 @@ class LowResolver:
                 if ec.timeEnd > self.constraint_time_end:
                     self.constraint_time_end = ec.timeEnd
 
+        # Cache visited states by location for cycle detection
+        self.visited_locations: Dict[Tuple[int, int], Set[int]] = {}
+
+        # Maximum time allowed for a single path search
+        self.max_search_time = 10.0  # seconds
+
+        # Target maximum path length - used for pruning extremely long paths
+        self.max_path_length = self.get_max_path_length()
+
+        # Cache for constraint validation to avoid repeated checks
+        self.constraint_cache: Dict[str, bool] = {}
+
         self.op = LowOp(
             robotName=ctx.robotName,
             highId=ctx.highId,
@@ -86,7 +98,7 @@ class LowResolver:
         op.endedOn = time.time()
         op.timeCost = op.endedOn - op.startedOn
         op.ok = r.ok
-        op.errMsg = op.errMsg
+        op.errMsg = r.errMsg
         op.path = r.path
 
         txt = op.to_json(indent=2)
@@ -113,11 +125,38 @@ class LowResolver:
         heapq.heappush(self.open_set, OpenLowNode(start_node))
         heapq.heappush(self.focal_set, FocalLowNode(start_node))
 
+        # Track the search start time for time-based pruning
+        search_start_time = time.time()
+
+        # Add start location to visited locations
+        self.add_visited_location(self.start_state.x, self.start_state.y, self.start_state.timeEnd)
+
         while self.open_set:
+            # Check if search time exceeded
+            if time.time() - search_start_time > self.max_search_time:
+                return TargetOnePlanResult(
+                    self.ctx.robotName,
+                    False,
+                    "Search time limit exceeded",
+                    planCost=time.time() - self.op.startedOn,
+                    fromState=self.start_state,
+                    toState=self.goal_state,
+                )
+
             # 每次进来重建 focal set，因此后续都不处理向 focal set 添加元素
             self.rebuild_focal_set()
 
             # 取出下一个有界最优启发值最低的节点
+            if not self.focal_set:
+                return TargetOnePlanResult(
+                    self.ctx.robotName,
+                    False,
+                    "No valid path found in focal set",
+                    planCost=time.time() - self.op.startedOn,
+                    fromState=self.start_state,
+                    toState=self.goal_state,
+                )
+
             min_focal_n: LowNode = heapq.heappop(self.focal_set).n
             min_focal_s = min_focal_n.state
 
@@ -132,6 +171,10 @@ class LowResolver:
 
             # 已展开的节点加入到 close
             self.closed_set[min_focal_s.time_state_key()] = min_focal_n
+
+            # Pruning: Early termination if path is getting too long
+            if min_focal_n.g > self.max_path_length:
+                continue  # Skip this node as the path is too long
 
             # 如果限制最大展开次数，超过则结束
             expanded_max = self.get_expanded_max()
@@ -152,7 +195,14 @@ class LowResolver:
             # 扩展节点
             neighbors = self.get_neighbors(min_focal_s)
             for neighbor in neighbors:
+                # Pruning: Skip neighbors that we've already visited at the same or earlier time
+                if self.is_location_visited_earlier(neighbor.x, neighbor.y, neighbor.timeEnd):
+                    continue
+
                 self.new_open_node(min_focal_n, neighbor)
+
+                # Record this location as visited
+                self.add_visited_location(neighbor.x, neighbor.y, neighbor.timeEnd)
 
         return TargetOnePlanResult(
             self.ctx.robotName,
@@ -168,6 +218,9 @@ class LowResolver:
         """
         整体重建 focal 集合
         """
+        if not self.open_set:
+            return
+
         min_f = self.open_set[0].n.f  # 读取 open 最小的节点，但不删除
         self.focal_set = []
         bound = min_f * self.ctx.w
@@ -179,20 +232,33 @@ class LowResolver:
         """
         限制最多展开次数。-1 表示不限制。
         """
-        return -1
-        # return self.ctx.mapDimX * self.ctx.mapDimY
+        # Set a reasonable limit based on map size to prevent excessive exploration
+        return self.ctx.mapDimX * self.ctx.mapDimY * 2
+
+    def get_max_path_length(self):
+        """
+        Estimate maximum reasonable path length based on map dimensions
+        """
+        # Manhattan distance + some buffer for detours
+        direct_distance = abs(self.start_state.x - self.goal_state.x) + abs(self.start_state.y - self.goal_state.y)
+        return direct_distance * 3 + 10  # Allow some detours and waiting
 
     def new_open_node(self, from_node: LowNode, neighbor: State):
         """
         构造新节点并添加到 open 集合
         """
-
+        # Skip if the neighbor would create a cycle (unless it's waiting)
         if not neighbor.wait:
             if self.detect_loop(from_node, neighbor):
                 self.op.logs.append(f"Loop, return, {neighbor}")
                 return
 
         g = from_node.g + neighbor.timeNum
+
+        # Pruning: Skip nodes that exceed our maximum path length estimate
+        if g > self.max_path_length:
+            return
+
         f = g + self.admissible_heuristic(neighbor)
         focal_value = self.calc_focal_value(from_node, neighbor, g, f)
         self.node_id += 1
@@ -203,7 +269,7 @@ class LowResolver:
         old_closed = self.closed_set.get(state_key)
         if old_closed:
             # 如果在 close 里
-            # TODO 判断 f 还是判断 g
+            # Improved: Consider reopening a closed node if we found a better path
             if f < old_closed.f:
                 self.op.warnings.append(f"SmallerFInClosed|{cell_index}|{neighbor.x},{neighbor.y}|"
                                         f"{neighbor.timeStart}:{neighbor.timeEnd}|"
@@ -228,36 +294,68 @@ class LowResolver:
         vs 欧氏距离
         不考虑旋转
         """
-        return (float(abs(state.x - self.goal_state.x) + abs(state.y - self.goal_state.y))
-                / self.ctx.moveUnitCost)
+        # Manhattan distance heuristic
+        manhattan_dist = float(abs(state.x - self.goal_state.x) + abs(state.y - self.goal_state.y))
+
+        # Add rotation cost estimate
+        rotation_cost = 0.0
+        if state.head != self.goal_state.head:
+            d_head = abs(state.head - self.goal_state.head)
+            if d_head > 180:
+                d_head = 360 - d_head
+            rotation_cost = float(d_head / 90) / self.ctx.rotateUnitCost
+
+        return (manhattan_dist / self.ctx.moveUnitCost) + rotation_cost
 
     def calc_focal_value(self, from_node: LowNode, to_state: State, to_state_g: float, to_state_f: float) -> float:
         """
         计算 focal 值。
         """
+        # Calculate conflicts with other robots plus a slight preference for shorter paths
+        conflicts = count_robot_transition_conflicts(self.ctx.robotName, from_node.state, to_state,
+                                                     self.ctx.oldAllPaths)
 
-        # case 1
-        # return to_state_g
-
-        # case 2
-        # return to_state_f
-
-        # case 3 计算这个状态转移与其他机器人的冲突数
-        # 假设约束当前机器人的其他机器人有 B、C、D，因为前面检查状态转移有效性时，已保证不与这些机器人冲突，
-        # 因此这里计算的是与 B、C、D 之外的其他机器人的冲突
-        return count_robot_transition_conflicts(self.ctx.robotName, from_node.state, to_state, self.ctx.oldAllPaths)
+        # Give slight preference to paths with fewer time steps
+        return conflicts * 10.0 + to_state_g * 0.1
 
     def get_neighbors(self, from_state: State) -> list[State]:
         neighbors = []
 
-        # 如果时间点已经晚于最后的约束，没必要等了
-        if from_state.timeEnd <= self.constraint_time_end:
+        # Pruning: If we're close to the goal, prioritize direct movements toward goal
+        is_close_to_goal = (abs(from_state.x - self.goal_state.x) + abs(from_state.y - self.goal_state.y)) <= 2
+
+        # If not close to the goal or time point is still before the last constraint, consider waiting
+        if not is_close_to_goal or from_state.timeEnd <= self.constraint_time_end:
             self.add_valid_neighbor(neighbors, from_state, 0, 0, from_state.head)  # waiting
 
-        self.add_valid_neighbor(neighbors, from_state, 1, 0, 0)
-        self.add_valid_neighbor(neighbors, from_state, -1, 0, 180)
-        self.add_valid_neighbor(neighbors, from_state, 0, 1, 90)
-        self.add_valid_neighbor(neighbors, from_state, 0, -1, 270)
+        # Calculate direction to goal for prioritizing movement
+        dx_to_goal = self.goal_state.x - from_state.x
+        dy_to_goal = self.goal_state.y - from_state.y
+
+        # Prioritize movements that bring us closer to the goal
+        directions = []
+
+        # Add horizontal movement toward goal
+        if dx_to_goal > 0:
+            directions.append((1, 0, 0))  # right
+        elif dx_to_goal < 0:
+            directions.append((-1, 0, 180))  # left
+
+        # Add vertical movement toward goal
+        if dy_to_goal > 0:
+            directions.append((0, 1, 90))  # down
+        elif dy_to_goal < 0:
+            directions.append((0, -1, 270))  # up
+
+        # Add remaining directions if not yet in the list
+        for direction in [(1, 0, 0), (-1, 0, 180), (0, 1, 90), (0, -1, 270)]:
+            if direction not in directions:
+                directions.append(direction)
+
+        # Try each direction
+        for dx, dy, to_head in directions:
+            self.add_valid_neighbor(neighbors, from_state, dx, dy, to_head)
+
         return neighbors
 
     def add_valid_neighbor(self, neighbors: list[State], from_state: State, dx: int, dy: int, to_head: int):
@@ -274,11 +372,10 @@ class LowResolver:
             return
 
         # 需要转的角度，初始，-270 ~ +270
-        # TODO 尽量小角度旋转
         d_head = abs(to_head - from_state.head)
         # 270 改成 90
         if d_head > 180:
-            d_head = 90
+            d_head = 360 - d_head
 
         d_head /= 90
 
@@ -319,11 +416,19 @@ class LowResolver:
         if not cs:
             return True
 
+        # Cache constraint validation results
+        cache_key = f"v_{to_state.x}_{to_state.y}_{to_state.timeStart}_{to_state.timeEnd}"
+        if cache_key in self.constraint_cache:
+            return self.constraint_cache[cache_key]
+
         v_constraints = cs.vertexConstraints
         for vc in v_constraints:
             if (to_state.is_same_location(vc) and
                     is_time_overlay(to_state.timeStart, to_state.timeEnd, vc.timeStart, vc.timeEnd)):
+                self.constraint_cache[cache_key] = False
                 return False
+
+        self.constraint_cache[cache_key] = True
         return True
 
     def transition_valid(self, from_state: State, to_state: State) -> bool:
@@ -334,12 +439,20 @@ class LowResolver:
         if not cs:
             return True
 
+        # Cache constraint validation results
+        cache_key = f"e_{from_state.x}_{from_state.y}_{to_state.x}_{to_state.y}_{from_state.timeStart}_{to_state.timeEnd}"
+        if cache_key in self.constraint_cache:
+            return self.constraint_cache[cache_key]
+
         e_constraints = cs.edgeConstraints
         # 起点、终点位置相同
         for ec in e_constraints:
             if (ec.x1 == from_state.x and ec.y1 == from_state.y and ec.x2 == to_state.x and ec.y2 == to_state.y and
                     is_time_overlay(from_state.timeStart, to_state.timeEnd, ec.timeStart, ec.timeEnd)):
+                self.constraint_cache[cache_key] = False
                 return False
+
+        self.constraint_cache[cache_key] = True
         return True
 
     def state_to_index(self, x: int, y: int):
@@ -407,8 +520,7 @@ class LowResolver:
             path=path
         )
 
-    @staticmethod
-    def detect_loop(from_node: LowNode, neighbor: State):
+    def detect_loop(self, from_node: LowNode, neighbor: State):
         """
         检查路径中是否出现过此位置
         """
@@ -417,4 +529,28 @@ class LowResolver:
             if n.state.is_same_location(neighbor):
                 return True
             n = n.parent
+        return False
+
+    def add_visited_location(self, x: int, y: int, time_end: int):
+        """
+        Record a visited location and its time
+        """
+        loc_key = (x, y)
+        if loc_key not in self.visited_locations:
+            self.visited_locations[loc_key] = set()
+        self.visited_locations[loc_key].add(time_end)
+
+    def is_location_visited_earlier(self, x: int, y: int, time_end: int) -> bool:
+        """
+        Check if location was visited at an earlier or equal time
+        """
+        loc_key = (x, y)
+        if loc_key not in self.visited_locations:
+            return False
+
+        # If we have visited this location at any earlier or same time, we can prune
+        for visited_time in self.visited_locations[loc_key]:
+            if visited_time <= time_end:
+                return True
+
         return False
