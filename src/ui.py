@@ -13,9 +13,9 @@ from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QScrol
 from pydash import find_index
 
 from src.adg import build_adg, to_adg_key
-from src.domain import MapConfig, MapReq, x_y_to_index, State, distance_of_two_points, \
-    MapfResult, RobotTaskReq, RobotTask, Cell, FaOp
-from src.ecbs import ECBS
+from src.common import x_y_to_index, distance_of_two_points
+from src.domain import MapConfig, MapReq, State, MapfResult, RobotTaskReq, RobotTask, Cell, LowOp
+from src.high_resolver import HighResolver
 from src.ui_cell import CellUi
 from src.ui_robot import RobotWidget
 
@@ -432,9 +432,9 @@ class MapfUi:
 
                         target_to_robot[n] = str(i)
 
-                        if to_index < 0:
-                            from_index = -1  # 重新选起点
-                            break
+                    if to_index < 0:
+                        from_index = -1  # 重新选起点
+                        break
 
             if from_index < 0:
                 QMessageBox.warning(self.main_window, "Warning", "No good start.")
@@ -464,7 +464,7 @@ class MapfUi:
         while open_set:
             expanded_count += 1
             top = open_set.pop(0)
-            print(f"expanded: [{expanded_count}]R={robot_name}|x={top.state.x}|y={top.state.y}|f={top.f}")
+            # print(f"expanded: [{expanded_count}]R={robot_name}|x={top.state.x}|y={top.state.y}|f={top.f}")
             if top.state.x == to_state.x and top.state.y == to_state.y:
                 return True
             close_set.append(top)
@@ -521,14 +521,14 @@ class MapfUi:
                                           toStates=[c2],
                                           stopTimes=self.map_config.goalStopTimes)
 
-        resolver = ECBS(
+        high_resolver = HighResolver(
             w=self.map_config.w,
             map_dim_x=self.map_config.mapDimX,
             map_dim_y=self.map_config.mapDimY,
             obstacles=self.map_config.obstacles,
             tasks=tasks,
         )
-        r = resolver.search()
+        r = high_resolver.search()
         self.plan = r
         self.result_edit.setText(r.to_json())
         print("Plan: " + str(r))
@@ -791,7 +791,7 @@ class MapfUi:
                 try:
                     with open(file_path, 'r', encoding='utf-8') as file:
                         content = file.read()
-                        op: FaOp = FaOp.from_json(content)
+                        op: LowOp = LowOp.from_json(content)
                         self.low_search_index = {}
                         for es in op.expandedList:
                             parts = es.split("|")

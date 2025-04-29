@@ -1,6 +1,5 @@
-import math
 from dataclasses import dataclass, field
-from typing import Optional, Callable
+from typing import Optional
 
 from dataclasses_json import dataclass_json
 
@@ -28,10 +27,6 @@ class TimeSteps:
     timeEnd: int  # 到达这个位置的时刻
 
 
-def is_time_overlay(start1: int, end1: int, start2: int, end2: int):
-    return start1 <= end2 and start2 <= end1
-
-
 @dataclass_json
 @dataclass(frozen=True)
 class State(Location, TimeSteps):
@@ -45,27 +40,23 @@ class State(Location, TimeSteps):
     """
     head: int
     timeNum: int
+    wait: bool = False
 
     def is_same_location(self, o: Location):
         return self.x == o.x and self.y == o.y
-
-    def is_time_overlay(self, o: TimeSteps):
-        return is_time_overlay(self.timeStart, self.timeEnd, o.timeStart, o.timeEnd)
 
     def desc_loc_head(self) -> str:
         return f"({self.x},{self.y},{self.head})"
 
     def desc(self, map_dim_x: int):
         index = self.x + self.y * map_dim_x
-        return f"{self.timeStart}:{self.timeEnd}|{index}|{self.x},{self.y}"
+        return f"{self.timeStart}:{self.timeEnd}|{index}|{self.x},{self.y}|{self.wait}"
 
+    def __str__(self):
+        return f"{self.timeStart}:{self.timeEnd}|{self.x},{self.y}@{self.head}|{self.wait}"
 
-def cell_to_state(c: Cell) -> State:
-    return State(x=c.x, y=c.y, timeStart=0, timeEnd=0, timeNum=0, head=0)
-
-
-def state_to_cell(s: State) -> Cell:
-    return Cell(s.x, s.y)
+    def time_state_key(self):
+        return f"{self.timeStart}:{self.timeEnd}|{self.x},{self.y}"
 
 
 @dataclass_json
@@ -77,8 +68,7 @@ class TargetOnePlanResult:
     robotName: str
     ok: bool = True
     reason: str = None
-    cost: float = 0.0
-    minF: float = 0.0
+    cost: float = 0.0  # 机器人执行成本
     expandedCount: int = 0
     planCost: float = 0  # 秒
     timeNum: int = 0
@@ -99,8 +89,7 @@ class TargetManyPlanResult:
     robotName: str
     ok: bool = True
     reason: str = None
-    cost: float = 0.0
-    minF: float = 0.0
+    cost: float = 0.0  # 机器人执行成本
     expandedCount: int = 0
     planCost: float = 0  # 秒
     timeNum: int = 0
@@ -143,37 +132,58 @@ class MapfResult:
 @dataclass_json
 @dataclass(frozen=True)
 class LowNode:
+    id: int
     state: State
     parent: Optional['LowNode'] = None
+    g: float = 0.0  # 到这个节点的成本
     f: float = 0.0
-    f2: float = 0.0
-    g: float = 0.0  # 到这个节点的实际成本
+    focalValue: float = 0.0  # 注意，这个不是一定是 f 值
 
     def desc(self, map_dim_x: int):
-        return f"{self.state.desc(map_dim_x)}|g={self.g}|f={self.f}|f2={self.f2}"
+        return f"{self.state.desc(map_dim_x)}|g={self.g}|f={self.f}|f2={self.focalValue}"
 
 
-@dataclass_json
-@dataclass(frozen=True)
-class VertexConstraint(TimeSteps, Location):
+class Constraint(TimeSteps):
     pass
 
 
 @dataclass_json
 @dataclass(frozen=True)
-class EdgeConstraint(TimeSteps):
+class VertexConstraint(Constraint, Location):
+    def __str__(self):
+        return f"V:{self.timeStart}:{self.timeEnd}|({self.x},{self.y})"
+
+
+@dataclass_json
+@dataclass(frozen=True)
+class EdgeConstraint(Constraint):
     x1: int
     y1: int
     x2: int
     y2: int
 
+    def __str__(self):
+        return f"E:{self.timeStart}:{self.timeEnd}|({self.x1},{self.y1})->({self.x2},{self.y2})"
+
 
 @dataclass_json
 @dataclass(frozen=True)
-class Constraints:
+class RobotConstraints:
+    """
+    一个机器人的所有约束
+    """
     robotName: str
-    vertexConstraints: field(default_factory=list)
-    edgeConstraints: field(default_factory=list)
+    vertexConstraints: set[VertexConstraint] = field(default_factory=set)
+    edgeConstraints: set[EdgeConstraint] = field(default_factory=set)
+
+
+@dataclass
+class ConflictConstraints:
+    """
+    一个冲突产生的约束
+    """
+    timeStart: int  # 最早时间
+    constraints: dict[str, Constraint]  # robot name ->
 
 
 @dataclass_json
@@ -182,10 +192,10 @@ class HighNode:
     id: int  # 节点 ID
     parentId: int
     solution: dict[str, TargetManyPlanResult]  # robot name ->
-    constraints: dict[str, Constraints]  # robot name ->
-    cost: float
-    lb: float
-    focalHeuristic: float
+    constraints: dict[str, RobotConstraints]  # robot name ->
+    cost: float  # 最终的所有机器人的 f 值相加
+    conflictsCount: int  # 这个高层节点中的冲突总数
+    firstConstraints: Optional[ConflictConstraints] = None  # 这个高层节点中的第一个冲突
 
 
 class OpenHighNode:
@@ -204,8 +214,8 @@ class FocalHighNode:
         self.n = n
 
     def __lt__(self, other: 'FocalHighNode'):
-        if self.n.focalHeuristic != other.n.focalHeuristic:
-            return self.n.focalHeuristic < other.n.focalHeuristic
+        if self.n.conflictsCount != other.n.conflictsCount:
+            return self.n.conflictsCount < other.n.conflictsCount
         return self.n.cost < other.n.cost
 
 
@@ -220,7 +230,10 @@ class OpenLowNode:
     def __lt__(self, other: 'OpenLowNode'):
         if self.n.f != other.n.f:
             return self.n.f < other.n.f
-        return other.n.g < self.n.g
+        elif self.n.g != other.n.g:
+            return self.n.g > other.n.g
+        else:
+            return self.n.id < other.n.id
 
 
 class FocalLowNode:
@@ -235,11 +248,14 @@ class FocalLowNode:
         self.n = n
 
     def __lt__(self, other: 'FocalLowNode'):
-        if self.n.f2 != other.n.f2:
-            return self.n.f2 < other.n.f2
+        if self.n.focalValue != other.n.focalValue:
+            return self.n.focalValue < other.n.focalValue
         elif self.n.f != other.n.f:
             return self.n.f < other.n.f
-        return other.n.g < self.n.g
+        elif self.n.g != other.n.g:
+            return self.n.g > other.n.g
+        else:
+            return self.n.id < other.n.id
 
 
 @dataclass_json
@@ -269,16 +285,8 @@ class MapReq:
     tasks: dict[str, RobotTaskReq]
 
 
-def x_y_to_index(x: int, y: int, map_dim_x: int) -> int:
-    return y * map_dim_x + x
-
-
-def distance_of_two_points(x1: int, y1: int, x2: int, y2: int) -> float:
-    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
-
-
 @dataclass
-class FaContext:
+class LowContext:
     robotName: str
     highId: int
     w: float
@@ -288,15 +296,16 @@ class FaContext:
     moveUnitCost: float
     rotateUnitCost: float
     goalStopTimeNum: int
-    neighborValidator: Optional[Callable[[State, State], bool]] = None
-    focalStateHeuristic: Optional[Callable[[State, float], float]] = None
-    focalTransitionHeuristic: Optional[Callable[[State, State, float, float], float]] = None
-    logLow: bool = False  # 是否打印底层搜索日志
+    constraints: Optional[RobotConstraints]  # 约束可能为空，初始求解时
+    oldAllPaths: dict[str, list[State]]  # 在进行此次底层求解所有机器人的已知路径
 
 
 @dataclass_json
 @dataclass
-class FaOp:
+class LowOp:
+    """
+    记录一次底层求解过程
+    """
     robotName: str
     highId: int
     lowId: int
@@ -311,9 +320,12 @@ class FaOp:
     goalCell: str
     startIndex: int
     goalIndex: int
+    constraints: Optional[RobotConstraints]
+    expandedNum: int
     expandedList: list[str]
     openSize: list[int]  # 每次展开后 open 集合的大小
     focalSize: list[int]  # 每次展开后 focal 集合的大小
+    logs: list[str]
     warnings: list[str]
     ok: bool = False
     errMsg: str = ""
